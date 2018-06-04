@@ -30,6 +30,12 @@
 #include <map>
 #include <set>
 
+#define KLEE_THREADING_SUPPORT 1
+#ifdef KLEE_THREADING_SUPPORT
+#include <pthread.h>
+#include <atomic>
+#endif
+
 struct KTest;
 
 namespace llvm {
@@ -70,6 +76,7 @@ namespace klee {
   class TimingSolver;
   class TreeStreamWriter;
   class MergeHandler;
+  class ExecutionRunner;
   template<class T> class ref;
 
 
@@ -86,6 +93,7 @@ class Executor : public Interpreter {
   friend class StatsTracker;
   friend class MergeHandler;
   friend class MergingSearcher;
+  friend class ExecutionRunner;
 
 public:
   class Timer {
@@ -118,6 +126,8 @@ public:
   };
 
 private:
+  ExecutionRunner* mainRunner;
+
   static const char *TerminateReasonNames[];
 
   class TimerInfo;
@@ -206,7 +216,7 @@ private:
 
   /// Signals the executor to halt execution at the next instruction
   /// step.
-  bool haltExecution;  
+  bool haltExecution;
 
   /// Whether implied-value concretization is enabled. Currently
   /// false, it is buggy (it needs to validate its writes).
@@ -215,8 +225,6 @@ private:
   /// The maximum time to allow for a single core solver query.
   /// (e.g. for a single STP query)
   double coreSolverTimeout;
-
-  bool hasScheduledThreads;
 
   /// Assumes ownership of the created array objects
   ArrayCache arrayCache;
@@ -232,7 +240,7 @@ private:
 
   llvm::Function* getTargetFunction(llvm::Value *calledVal,
                                     ExecutionState &state);
-  
+
   void executeInstruction(ExecutionState &state, KInstruction *ki);
 
   void printFileLine(ExecutionState &state, KInstruction *ki,
@@ -252,7 +260,7 @@ private:
 
   void stepInstruction(ExecutionState &state);
   void updateStates(ExecutionState *current);
-  void transferToBasicBlock(llvm::BasicBlock *dst, 
+  void transferToBasicBlock(llvm::BasicBlock *dst,
 			    llvm::BasicBlock *src,
 			    ExecutionState &state);
 
@@ -309,12 +317,12 @@ private:
   void executeFree(ExecutionState &state,
                    ref<Expr> address,
                    KInstruction *target = 0);
-  
-  void executeCall(ExecutionState &state, 
+
+  void executeCall(ExecutionState &state,
                    KInstruction *ki,
                    llvm::Function *f,
                    std::vector< ref<Expr> > &arguments);
-                   
+
   // do address resolution / object binding / out of bounds checking
   // and perform the operation
   void executeMemoryOperation(ExecutionState &state,
@@ -330,7 +338,7 @@ private:
   /// a constraint and return the results. The input state is included
   /// as one of the results. Note that the output vector may included
   /// NULL pointers for states which were unable to be created.
-  void branch(ExecutionState &state, 
+  void branch(ExecutionState &state,
               const std::vector< ref<Expr> > &conditions,
               std::vector<ExecutionState*> &result);
 
@@ -349,7 +357,7 @@ private:
   // Used for testing.
   ref<Expr> replaceReadWithSymbolic(ExecutionState &state, ref<Expr> e);
 
-  const Cell& eval(KInstruction *ki, unsigned index, 
+  const Cell& eval(KInstruction *ki, unsigned index,
                    ExecutionState &state) const;
 
   Cell& getArgumentCell(ExecutionState &state,
@@ -398,7 +406,7 @@ private:
   /// should generally be avoided.
   ///
   /// \param purpose An identify string to printed in case of concretization.
-  ref<klee::ConstantExpr> toConstant(ExecutionState &state, ref<Expr> e, 
+  ref<klee::ConstantExpr> toConstant(ExecutionState &state, ref<Expr> e,
                                      const char *purpose);
 
   /// Bind a constant value for e to the given target. NOTE: This
@@ -450,8 +458,8 @@ private:
   /// constant values.
   void bindInstructionConstants(KInstruction *KI);
 
-  void handlePointsToObj(ExecutionState &state, 
-                         KInstruction *target, 
+  void handlePointsToObj(ExecutionState &state,
+                         KInstruction *target,
                          const std::vector<ref<Expr> > &arguments);
 
   void doImpliedValueConcretization(ExecutionState &state,
