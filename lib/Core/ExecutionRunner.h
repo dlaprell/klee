@@ -2,17 +2,66 @@
 #define KLEE_EXECUTIONRUNNER_H
 
 #include "Executor.h"
+#include "Searcher.h"
+
+#define KLEE_THREADING_SUPPORT 1
+#ifdef KLEE_THREADING_SUPPORT
+#include <pthread.h>
+#include <atomic>
+#endif
 
 namespace klee {
-  class ExecutionRunner {
+  class SpecialFunctionHandler;
+
+  class ExecutionRunner : ExecutorStateProvider {
     friend class Executor;
+    friend class SpecialFunctionHandler;
+
+    public:
+      typedef struct _JobEntry {
+        ExecutionState* state;
+        PTree* tree;
+
+        // This function is used by set to order
+        // elements of Test.
+        bool operator<(const _JobEntry& t) const {
+          return (this->state < t.state && this->tree < t.tree);
+        }
+      } JobEntry;
 
     private:
+      enum InternalState {
+        IDLE = 0,
+        PAUSED = 1,
+        WORKING = 2
+      };
+
       Searcher *searcher;
-      PTree *processTree;
       TimingSolver *solver;
       Executor* executor;
       SpecialFunctionHandler* specialFunctionHandler;
+
+      /* Main internal state management */
+      std::atomic<bool> isInPause;
+      std::atomic<bool> shouldEnterPausePhase;
+      std::atomic<bool> hasOverload;
+
+      /* Job sync helper utils */
+
+      /// Queue of all waiting jobs that need to be computed
+      std::set<JobEntry> pendingJobs;
+      std::set<JobEntry>::iterator currentJob;
+
+      std::atomic<uint64_t > currentStateCount;
+
+#ifdef KLEE_THREADING_SUPPORT
+      pthread_cond_t waitingCondLock;
+      pthread_mutex_t waitingMutex;
+#endif
+      /* Execution related stuff */
+
+      /// Tree of the current execution
+      PTree *processTree;
 
       std::set<ExecutionState*> states;
 
@@ -38,7 +87,23 @@ namespace klee {
       explicit ExecutionRunner(Executor* exec);
       void stepInState(ExecutionState& state);
 
+      void processNewJob(JobEntry entry);
+
+      std::set<ExecutionState*>* getCurrentStates();
+      PTree* getCurrentTree();
+      std::vector<MergeHandler *> getCurrentMergeGroups();
+
     private:
+      void moveToNewJob();
+      void workLoop();
+
+      void wakeUp();
+      void pause();
+
+      bool isPaused();
+
+      void updateStates(ExecutionState *current);
+
       Cell& getArgumentCell(ExecutionState &state,
                             KFunction *kf,
                             unsigned index) {
@@ -174,7 +239,7 @@ namespace klee {
       void terminateStateEarly(ExecutionState &state, const llvm::Twine &message);
       // call exit handler and terminate state
       void terminateStateOnExit(ExecutionState &state);
-      // call error handler and terminate state
+
       void terminateStateOnError(ExecutionState &state, const llvm::Twine &message,
                                  enum Executor::TerminateReason termReason,
                                  const char *suffix = NULL,

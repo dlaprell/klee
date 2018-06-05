@@ -20,6 +20,7 @@
 #if LLVM_VERSION_CODE < LLVM_VERSION(3, 5)
 #include "llvm/Support/CallSite.h"
 #include "CoreStats.h"
+#include "UserSearcher.h"
 
 #else
 #include "llvm/IR/CallSite.h"
@@ -44,10 +45,31 @@ RNG theRNG;
 
 ExecutionRunner::ExecutionRunner(Executor* exec) : executor(exec) {
   solver = nullptr;
+
+  currentJob = pendingJobs.end();
+  processTree = nullptr;
+  isInPause = false;
+  shouldEnterPausePhase = false;
+  hasOverload = false;
+
+  pthread_mutex_init(&waitingMutex, nullptr);
+  pthread_cond_init(&waitingCondLock, nullptr);
+}
+
+std::set<ExecutionState*>* ExecutionRunner::getCurrentStates() {
+  return &states;
+}
+
+PTree* ExecutionRunner::getCurrentTree() {
+  return processTree;
+}
+
+std::vector<MergeHandler *> ExecutionRunner::getCurrentMergeGroups() {
+  return std::vector<MergeHandler*>();
 }
 
 void ExecutionRunner::stepInstruction(ExecutionState &state) {
-  // printDebugInstructions(state);
+  executor->printDebugInstructions(state);
 
   //if (statsTracker)
   //  statsTracker->stepInstruction(state);
@@ -473,7 +495,7 @@ void ExecutionRunner::executeCall(ExecutionState &state,
       }
 
       MemoryObject *mo = sf.varargs =
-                                 executor->memory->allocate(size, true, false, thread->prevPc->inst,
+                                 executor->doAllocate(size, true, false, thread->prevPc->inst,
                                                   (requires16ByteAlignment ? 16 : 8));
       if (!mo && size) {
         terminateStateOnExecError(state, "out of memory (varargs)");
@@ -1607,14 +1629,126 @@ void ExecutionRunner::stepInState(ExecutionState& state) {
 
   bool shouldForkAfterStatement = false;
   if (ForkOnStatement) {
-    auto itInRemoved = std::find(executor->removedStates.begin(), executor->removedStates.end(), &state);
-    shouldForkAfterStatement = itInRemoved == executor->removedStates.end();
+    auto itInRemoved = std::find(removedStates.begin(), removedStates.end(), &state);
+    shouldForkAfterStatement = itInRemoved == removedStates.end();
   }
 
   // We only want to fork if we do not have forked already
   if (shouldForkAfterStatement && !state.hasScheduledThreads) {
     scheduleThreads(state);
   }
+}
+
+void ExecutionRunner::updateStates(ExecutionState *current) {
+  if (searcher) {
+    searcher->update(current, addedStates, removedStates);
+    searcher->update(nullptr, continuedStates, pausedStates);
+    pausedStates.clear();
+    continuedStates.clear();
+  }
+
+  states.insert(addedStates.begin(), addedStates.end());
+  addedStates.clear();
+
+  for (auto& it : removedStates) {
+    ExecutionState *es = it;
+    auto it2 = states.find(es);
+    assert(it2 != states.end() && "Cannot remove a state that does not exist in states");
+    states.erase(it2);
+
+//    std::map<ExecutionState*, std::vector<SeedInfo> >::iterator it3 =
+//            seedMap.find(es);
+//    if (it3 != seedMap.end())
+//      seedMap.erase(it3);
+
+    processTree->remove(es->ptreeNode);
+    delete es;
+  }
+  removedStates.clear();
+}
+
+void ExecutionRunner::workLoop() {
+  while (!executor->haltExecution) {
+    pthread_testcancel();
+
+    // The whole update procedure should happen here
+    pthread_mutex_lock(&waitingMutex);
+    if (states.empty()) {
+      // Whoops -> current job has finished
+      processTree = nullptr;
+
+      if (currentJob != pendingJobs.end()) {
+        pendingJobs.erase(currentJob);
+        currentJob = pendingJobs.end();
+      }
+
+      if (pendingJobs.empty()) {
+        shouldEnterPausePhase = true;
+        hasOverload = false;
+      } else {
+        moveToNewJob();
+        isInPause = false;
+        hasOverload = pendingJobs.size() >= 2;
+      }
+    } else if (states.size() > 1) {
+      hasOverload = true;
+    }
+
+    if (shouldEnterPausePhase) {
+      isInPause = true;
+      shouldEnterPausePhase = false;
+      pthread_cond_wait(&waitingCondLock, &waitingMutex);
+      pthread_mutex_unlock(&waitingMutex);
+      continue;
+    }
+    pthread_mutex_unlock(&waitingMutex);
+
+    // Actual working phase
+    ExecutionState& state = searcher->selectState();
+
+    stepInState(state);
+    updateStates(&state);
+  }
+}
+
+void ExecutionRunner::moveToNewJob() {
+  currentJob = pendingJobs.begin();
+
+  assert(states.empty() && addedStates.empty() && removedStates.empty()
+         && pausedStates.empty() && continuedStates.empty()
+         && "States should be empty to process a new job");
+
+  states.insert(currentJob->state);
+  currentStateCount = 1;
+  processTree = currentJob->tree;
+
+  // Notify the searcher about the new states
+  std::vector<ExecutionState *> newStates(states.begin(), states.end());
+  searcher->update(nullptr, newStates, std::vector<ExecutionState *>());
+
+  // stepInState(*currentJob->state);
+}
+
+bool ExecutionRunner::isPaused() {
+  return isInPause;
+}
+
+void ExecutionRunner::pause() {
+  pthread_mutex_lock(&waitingMutex);
+  shouldEnterPausePhase = true;
+  pthread_mutex_unlock(&waitingMutex);
+}
+
+void ExecutionRunner::wakeUp() {
+  pthread_mutex_lock(&waitingMutex);
+  shouldEnterPausePhase = false;
+  isInPause = false;
+  pthread_cond_broadcast(&waitingCondLock);
+  pthread_mutex_unlock(&waitingMutex);
+}
+
+void ExecutionRunner::processNewJob(JobEntry entry) {
+  pendingJobs.insert(entry);
 }
 
 // XXX shoot me
@@ -1843,7 +1977,7 @@ void ExecutionRunner::executeAlloc(ExecutionState &state,
     const llvm::Value *allocSite = thread->prevPc->inst;
     size_t allocationAlignment = getAllocationAlignment(allocSite);
     MemoryObject *mo =
-            executor->memory->allocate(CE->getZExtValue(), isLocal, /*isGlobal=*/false,
+            executor->doAllocate(CE->getZExtValue(), isLocal, /*isGlobal=*/false,
                              allocSite, allocationAlignment);
     if (!mo) {
       bindLocal(target, state,
@@ -2894,22 +3028,103 @@ void ExecutionRunner::scheduleThreads(ExecutionState &state) {
 // TODO: For now just pass down to the executor
 
 void ExecutionRunner::terminateState(ExecutionState &state) {
+//  if (replayKTest && replayPosition!=replayKTest->numObjects) {
+//    klee_warning_once(replayKTest,
+//                      "replay did not consume all objects in test input.");
+//  }
+//
+//  interpreterHandler->incPathsExplored();
+
   executor->terminateState(state);
+
+  auto it = std::find(addedStates.begin(), addedStates.end(), &state);
+  if (it == addedStates.end()) {
+    Thread* thread = state.getCurrentThreadReference();
+    thread->pc = thread->prevPc;
+
+    removedStates.push_back(&state);
+  } else {
+//    // never reached searcher, just delete immediately
+//    auto it3 = seedMap.find(&state);
+//    if (it3 != seedMap.end())
+//      seedMap.erase(it3);
+
+    addedStates.erase(it);
+    processTree->remove(state.ptreeNode);
+    delete &state;
+  }
 }
 
-void ExecutionRunner::terminateStateEarly(ExecutionState &state, const llvm::Twine &message) {
+void ExecutionRunner::terminateStateEarly(ExecutionState &state,
+                                          const Twine &message) {
+//  if (!OnlyOutputStatesCoveringNew || state.coveredNew ||
+//      (AlwaysOutputSeeds && seedMap.count(&state)))
+//    interpreterHandler->processTestCase(state, (message + "\n").str().c_str(),
+//                                        "early");
   executor->terminateStateEarly(state, message);
+  terminateState(state);
 }
 
 void ExecutionRunner::terminateStateOnExit(ExecutionState &state) {
+//  if (!OnlyOutputStatesCoveringNew || state.coveredNew ||
+//      (AlwaysOutputSeeds && seedMap.count(&state)))
+//    interpreterHandler->processTestCase(state, 0, 0);
+
   executor->terminateStateOnExit(state);
+  terminateState(state);
 }
 
-void ExecutionRunner::terminateStateOnError(ExecutionState &state, const llvm::Twine &message,
-                           enum Executor::TerminateReason termReason,
-                           const char *suffix,
-                           const llvm::Twine &longMessage ) {
-   executor->terminateStateOnError(state, message, termReason, suffix, longMessage);
+void ExecutionRunner::terminateStateOnError(ExecutionState &state,
+                                            const llvm::Twine &messaget,
+                                            enum Executor::TerminateReason termReason,
+                                            const char *suffix,
+                                            const llvm::Twine &info) {
+//  std::string message = messaget.str();
+//  static std::set< std::pair<Instruction*, std::string> > emittedErrors;
+//  Instruction * lastInst;
+//  const InstructionInfo &ii = getLastNonKleeInternalInstruction(state, &lastInst);
+//
+//  if (EmitAllErrors ||
+//      emittedErrors.insert(std::make_pair(lastInst, message)).second) {
+//    if (ii.file != "") {
+//      klee_message("ERROR: %s:%d: %s", ii.file.c_str(), ii.line, message.c_str());
+//    } else {
+//      klee_message("ERROR: (location information missing) %s", message.c_str());
+//    }
+//    if (!EmitAllErrors)
+//      klee_message("NOTE: now ignoring this error at this location");
+//
+//    std::string MsgString;
+//    llvm::raw_string_ostream msg(MsgString);
+//    msg << "Error: " << message << "\n";
+//    if (ii.file != "") {
+//      msg << "File: " << ii.file << "\n";
+//      msg << "Line: " << ii.line << "\n";
+//      msg << "assembly.ll line: " << ii.assemblyLine << "\n";
+//    }
+//    msg << "Stack: \n";
+//    state.dumpStack(msg);
+//
+//    std::string info_str = info.str();
+//    if (!info_str.empty())
+//      msg << "Info: \n" << info_str;
+//
+//    std::string suffix_buf;
+//    if (!suffix) {
+//      suffix_buf = TerminateReasonNames[termReason];
+//      suffix_buf += ".err";
+//      suffix = suffix_buf.c_str();
+//    }
+//
+//    interpreterHandler->processTestCase(state, msg.str().c_str(), suffix);
+//  }
+
+  executor->terminateStateOnError(state, messaget, termReason, suffix, info);
+
+  terminateState(state);
+
+//  if (shouldExitOn(termReason))
+//    haltExecution = true;
 }
 
 /*###################### GRAVEYARD ###################*/

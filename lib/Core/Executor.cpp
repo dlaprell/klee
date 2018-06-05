@@ -302,16 +302,6 @@ namespace {
   MaxMemoryInhibit("max-memory-inhibit",
             cl::desc("Inhibit forking at memory cap (vs. random terminate) (default=on)"),
             cl::init(true));
-
-  cl::opt<bool>
-  ForkOnThreadScheduling("fork-on-thread-scheduling",
-            cl::desc("Fork the states whenever the thread scheduling is not trivial"),
-            cl::init(false));
-
-  cl::opt<bool>
-  ForkOnStatement("fork-on-statement",
-            cl::desc("Fork the current state whenever a possible thread scheduling can take place"),
-            cl::init(false));
 }
 
 
@@ -351,27 +341,16 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
       debugInstFile(0), debugLogBuffer(debugBufferString) {
 
   if (coreSolverTimeout) UseForkedCoreSolver = true;
-  Solver *coreSolver = klee::createCoreSolver(CoreSolverToUse);
-  if (!coreSolver) {
-    klee_error("Failed to create core solver\n");
-  }
-
-  Solver *solver = constructSolverChain(
-      coreSolver,
-      interpreterHandler->getOutputFilename(ALL_QUERIES_SMT2_FILE_NAME),
-      interpreterHandler->getOutputFilename(SOLVER_QUERIES_SMT2_FILE_NAME),
-      interpreterHandler->getOutputFilename(ALL_QUERIES_KQUERY_FILE_NAME),
-      interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME));
-
-  this->solver = new TimingSolver(solver, EqualitySubstitution);
+  this->solver = createNewSolver();
   memory = new MemoryManager(&arrayCache);
 
-  mainRunner = new ExecutionRunner(this);
-  // TODO: every one should have its own solver
-  mainRunner->solver = this->solver;
-  mainRunner->processTree = this->processTree;
+  pthread_mutex_init(&memoryLock, nullptr);
+  pthread_mutex_init(&terminateLock, nullptr);
 
   initializeSearchOptions();
+
+  createJobHelper();
+  mainRunner = jobs.begin()->runner;
 
   if (OnlyOutputStatesCoveringNew && !StatsTracker::useIStats())
     klee_error("To use --only-output-states-covering-new, you need to enable --output-istats.");
@@ -412,6 +391,53 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
   }
 }
 
+TimingSolver* Executor::createNewSolver() {
+  Solver *coreSolver = klee::createCoreSolver(CoreSolverToUse);
+  if (!coreSolver) {
+    klee_error("Failed to create core solver\n");
+  }
+
+  Solver *solver = constructSolverChain(
+          coreSolver,
+          interpreterHandler->getOutputFilename(ALL_QUERIES_SMT2_FILE_NAME),
+          interpreterHandler->getOutputFilename(SOLVER_QUERIES_SMT2_FILE_NAME),
+          interpreterHandler->getOutputFilename(ALL_QUERIES_KQUERY_FILE_NAME),
+          interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME));
+
+  return new TimingSolver(solver, EqualitySubstitution);
+}
+
+void Executor::createJobHelper() {
+  JobHelper helper;
+
+  helper.spawnedThread = false;
+  helper.runner = new ExecutionRunner(this);
+  helper.runner->solver = createNewSolver();
+  helper.runner->searcher = constructUserSearcher(helper.runner);
+  helper.runner->specialFunctionHandler = this->specialFunctionHandler;
+
+  jobs.push_back(helper);
+}
+
+MemoryObject* Executor::doAllocate(uint64_t size, bool isLocal,
+                                   bool isGlobal,
+                                   const llvm::Value *allocSite,
+                                   size_t alignment) {
+  MemoryObject* mo = nullptr;
+  pthread_mutex_lock(&memoryLock);
+  memory->allocate(size, isLocal, isGlobal, allocSite, alignment);
+  pthread_mutex_unlock(&memoryLock);
+  return mo;
+}
+
+MemoryObject* Executor::doAllocateFixed(uint64_t address, uint64_t size,
+                              const llvm::Value *allocSite) {
+  MemoryObject* mo = nullptr;
+  pthread_mutex_lock(&memoryLock);
+  memory->allocateFixed(address, size, allocSite);
+  pthread_mutex_unlock(&memoryLock);
+  return mo;
+}
 
 const Module *Executor::setModule(llvm::Module *module, 
                                   const ModuleOptions &opts) {
@@ -687,41 +713,41 @@ void Executor::initializeGlobals(ExecutionState &state) {
   }
 }
 
-//void Executor::printDebugInstructions(ExecutionState &state) {
-//  // check do not print
+void Executor::printDebugInstructions(ExecutionState &state) {
+  // check do not print
 //  if (DebugPrintInstructions.getBits() == 0)
 //	  return;
-//
-//  llvm::raw_ostream *stream = 0;
-//  if (DebugPrintInstructions.isSet(STDERR_ALL) ||
-//      DebugPrintInstructions.isSet(STDERR_SRC) ||
-//      DebugPrintInstructions.isSet(STDERR_COMPACT))
-//    stream = &llvm::errs();
-//  else
-//    stream = &debugLogBuffer;
-//
-//  Thread* thread = state.getCurrentThreadReference();
-//
-//  if (!DebugPrintInstructions.isSet(STDERR_COMPACT) &&
-//      !DebugPrintInstructions.isSet(FILE_COMPACT)) {
-//    (*stream) << "     " << thread->pc->getSourceLocation() << ":";
-//  }
-//
-//  (*stream) << thread->pc->info->assemblyLine;
-//
-//  if (DebugPrintInstructions.isSet(STDERR_ALL) ||
-//      DebugPrintInstructions.isSet(FILE_ALL))
-//    (*stream) << ":" << *(thread->pc->inst);
-//  (*stream) << "\n";
-//
-//  if (DebugPrintInstructions.isSet(FILE_ALL) ||
-//      DebugPrintInstructions.isSet(FILE_COMPACT) ||
-//      DebugPrintInstructions.isSet(FILE_SRC)) {
-//    debugLogBuffer.flush();
-//    (*debugInstFile) << debugLogBuffer.str();
-//    debugBufferString = "";
-//  }
-//}
+
+  llvm::raw_ostream *stream = 0;
+  if (DebugPrintInstructions.isSet(STDERR_ALL) ||
+      DebugPrintInstructions.isSet(STDERR_SRC) ||
+      DebugPrintInstructions.isSet(STDERR_COMPACT))
+    stream = &llvm::errs();
+  else
+    stream = &debugLogBuffer;
+
+  Thread* thread = state.getCurrentThreadReference();
+
+  if (!DebugPrintInstructions.isSet(STDERR_COMPACT) &&
+      !DebugPrintInstructions.isSet(FILE_COMPACT)) {
+    (*stream) << "     " << thread->pc->getSourceLocation() << ":";
+  }
+
+  (*stream) << thread->pc->info->assemblyLine;
+
+  if (DebugPrintInstructions.isSet(STDERR_ALL) ||
+      DebugPrintInstructions.isSet(FILE_ALL))
+    (*stream) << ":" << *(thread->pc->inst);
+  (*stream) << "\n";
+
+  if (DebugPrintInstructions.isSet(FILE_ALL) ||
+      DebugPrintInstructions.isSet(FILE_COMPACT) ||
+      DebugPrintInstructions.isSet(FILE_SRC)) {
+    debugLogBuffer.flush();
+    (*debugInstFile) << debugLogBuffer.str();
+    debugBufferString = "";
+  }
+}
 
 static inline const llvm::fltSemantics * fpWidthToSemantics(unsigned width) {
   switch(width) {
@@ -871,6 +897,53 @@ void Executor::doDumpStates() {
   updateStates(nullptr);
 }
 
+void Executor::balanceRunners(ExecutionRunner* to, ExecutionRunner* from) {
+  // Possibly unsafe ...
+  pthread_mutex_lock(&from->waitingMutex);
+  assert(pthread_mutex_trylock(&to->waitingMutex) != EBUSY && "Could not lock needed lock");
+
+  bool ready = false;
+
+  // First test if we can get a job from the current job queue
+  if (from->pendingJobs.size() > 1) {
+    auto it = from->pendingJobs.begin();
+    while (it != from->currentJob && it != from->pendingJobs.end()) {
+      it++;
+    }
+
+    if (it != from->pendingJobs.end()) {
+      to->processNewJob(*it);
+      from->pendingJobs.erase(it);
+      ready = true;
+    }
+  }
+
+  if (!ready && from->states.size() >= 2) {
+    // More complicated, we have to remove one state out of the set and have to
+    // generate a whole new tree
+
+    auto transferState = from->states.begin();
+    from->pausedStates.push_back(*transferState);
+
+    // Use the internal method to pause the state
+    from->updateStates(nullptr);
+    from->processTree->remove((*transferState)->ptreeNode);
+
+    // Now add the job to the new state
+    ExecutionRunner::JobEntry entry;
+    entry.state = *transferState;
+    entry.tree = new PTree(entry.state);
+    entry.state->ptreeNode = entry.tree->root;
+    to->processNewJob(entry);
+
+    // Make sure it is really deleted
+    from->states.erase(transferState);
+  }
+
+  pthread_mutex_unlock(&to->waitingMutex);
+  pthread_mutex_unlock(&from->waitingMutex);
+}
+
 void Executor::run(ExecutionState &initialState) {
   bindModuleConstants();
 
@@ -950,26 +1023,110 @@ void Executor::run(ExecutionState &initialState) {
 //    }
 //  }
 
-  searcher = constructUserSearcher(*this);
+  ExecutionRunner::JobEntry main;
+  main.tree = processTree;
+  main.state = &initialState;
 
-  std::vector<ExecutionState *> newStates(states.begin(), states.end());
-  searcher->update(0, newStates, std::vector<ExecutionState *>());
+  mainRunner->processNewJob(main);
+  createJobHelper();
 
-  while (!states.empty() && !haltExecution) {
-    ExecutionState &state = searcher->selectState();
+  for (auto& helper : jobs) {
+    if (helper.spawnedThread) {
+      continue;
+    }
 
-    mainRunner->stepInState(state);
-    addedStates = mainRunner->addedStates;
-    mainRunner->addedStates.clear();
-
-    processTimers(&state, MaxInstructionTime);
-
-    checkMemoryUsage();
-    updateStates(&state);
+    helper.spawnedThread = true;
+    pthread_create(&helper.thread, nullptr, [](void* _runner) -> void* {
+      auto runner = (ExecutionRunner*) _runner;
+      runner->workLoop();
+      return nullptr;
+    }, helper.runner);
   }
 
-  delete searcher;
-  searcher = nullptr;
+  while (!haltExecution) {
+    // So we want to balance the work between the workers
+    for (auto& helper : jobs) {
+      printf("%p has num states: %u  ", helper.runner, helper.runner->states.size());
+    }
+    printf("\n");
+
+    for (auto& helper : jobs) {
+      if (!helper.runner->isPaused()) {
+        continue;
+      }
+
+      ExecutionRunner* balanceFrom = nullptr;
+      bool oneIsProcessing = false;
+
+      // This worker has nothing to do at the moment so go ahead and make it better
+      // but we need one where we can balance from
+      for (auto& possibleHelper : jobs) {
+        if (possibleHelper.runner == helper.runner) {
+          continue;
+        }
+
+        if (possibleHelper.runner->isPaused()) {
+          continue;
+        }
+
+        oneIsProcessing = true;
+
+        if (!possibleHelper.runner->hasOverload) {
+          continue;
+        }
+
+        possibleHelper.runner->pause();
+        while(!possibleHelper.runner->isPaused());
+
+        if (possibleHelper.runner->pendingJobs.size() > 1 || possibleHelper.runner->states.size() >= 2) {
+          balanceFrom = possibleHelper.runner;
+          break;
+        } else {
+          possibleHelper.runner->wakeUp();
+          continue;
+        }
+      }
+
+      if (!oneIsProcessing && balanceFrom == nullptr) {
+        haltExecution = true;
+      }
+
+      if (balanceFrom != nullptr) {
+        printf("Rebalancing from %p to %p\n", balanceFrom, helper.runner);
+        balanceRunners(helper.runner, balanceFrom);
+        helper.runner->wakeUp();
+        balanceFrom->wakeUp();
+      }
+    }
+  }
+
+  for (auto& helper : jobs) {
+    if (helper.spawnedThread) {
+      pthread_cancel(helper.thread);
+      pthread_join(helper.thread, nullptr);
+    }
+  }
+
+//  searcher = constructUserSearcher(*this);
+//
+//  std::vector<ExecutionState *> newStates(states.begin(), states.end());
+//  searcher->update(0, newStates, std::vector<ExecutionState *>());
+//
+//  while (!states.empty() && !haltExecution) {
+//    ExecutionState &state = searcher->selectState();
+//
+//    mainRunner->stepInState(state);
+//    addedStates = mainRunner->addedStates;
+//    mainRunner->addedStates.clear();
+//
+//    processTimers(&state, MaxInstructionTime);
+//
+//    checkMemoryUsage();
+//    updateStates(&state);
+//  }
+//
+//  delete searcher;
+//  searcher = nullptr;
 
   doDumpStates();
 }
@@ -998,46 +1155,52 @@ void Executor::continueState(ExecutionState &state){
 }
 
 void Executor::terminateState(ExecutionState &state) {
+  pthread_mutex_lock(&terminateLock);
   if (replayKTest && replayPosition!=replayKTest->numObjects) {
     klee_warning_once(replayKTest,
                       "replay did not consume all objects in test input.");
   }
 
   interpreterHandler->incPathsExplored();
+  pthread_mutex_unlock(&terminateLock);
 
-  std::vector<ExecutionState *>::iterator it =
-      std::find(addedStates.begin(), addedStates.end(), &state);
-  if (it == addedStates.end()) {
-    Thread* thread = state.getCurrentThreadReference();
-    thread->pc = thread->prevPc;
-
-    removedStates.push_back(&state);
-  } else {
-    // never reached searcher, just delete immediately
-    std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it3 = 
-      seedMap.find(&state);
-    if (it3 != seedMap.end())
-      seedMap.erase(it3);
-    addedStates.erase(it);
-    processTree->remove(state.ptreeNode);
-    delete &state;
-  }
+//  std::vector<ExecutionState *>::iterator it =
+//      std::find(addedStates.begin(), addedStates.end(), &state);
+//  if (it == addedStates.end()) {
+//    Thread* thread = state.getCurrentThreadReference();
+//    thread->pc = thread->prevPc;
+//
+//    removedStates.push_back(&state);
+//  } else {
+//    // never reached searcher, just delete immediately
+//    std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it3 =
+//      seedMap.find(&state);
+//    if (it3 != seedMap.end())
+//      seedMap.erase(it3);
+//    addedStates.erase(it);
+//    processTree->remove(state.ptreeNode);
+//    delete &state;
+//  }
 }
 
 void Executor::terminateStateEarly(ExecutionState &state, 
                                    const Twine &message) {
+  pthread_mutex_lock(&terminateLock);
   if (!OnlyOutputStatesCoveringNew || state.coveredNew ||
       (AlwaysOutputSeeds && seedMap.count(&state)))
     interpreterHandler->processTestCase(state, (message + "\n").str().c_str(),
                                         "early");
-  terminateState(state);
+  pthread_mutex_unlock(&terminateLock);
+//  terminateState(state);
 }
 
 void Executor::terminateStateOnExit(ExecutionState &state) {
+  pthread_mutex_lock(&terminateLock);
   if (!OnlyOutputStatesCoveringNew || state.coveredNew || 
       (AlwaysOutputSeeds && seedMap.count(&state)))
     interpreterHandler->processTestCase(state, 0, 0);
-  terminateState(state);
+  pthread_mutex_unlock(&terminateLock);
+//  terminateState(state);
 }
 
 const InstructionInfo & Executor::getLastNonKleeInternalInstruction(const ExecutionState &state,
@@ -1101,11 +1264,13 @@ void Executor::terminateStateOnError(ExecutionState &state,
                                      enum TerminateReason termReason,
                                      const char *suffix,
                                      const llvm::Twine &info) {
+  pthread_mutex_lock(&terminateLock);
+
   std::string message = messaget.str();
   static std::set< std::pair<Instruction*, std::string> > emittedErrors;
   Instruction * lastInst;
   const InstructionInfo &ii = getLastNonKleeInternalInstruction(state, &lastInst);
-  
+
   if (EmitAllErrors ||
       emittedErrors.insert(std::make_pair(lastInst, message)).second) {
     if (ii.file != "") {
@@ -1140,11 +1305,13 @@ void Executor::terminateStateOnError(ExecutionState &state,
 
     interpreterHandler->processTestCase(state, msg.str().c_str(), suffix);
   }
-    
-  terminateState(state);
+
+//  terminateState(state);
 
   if (shouldExitOn(termReason))
     haltExecution = true;
+
+  pthread_mutex_unlock(&terminateLock);
 }
 
 ObjectState *Executor::bindObjectInState(ExecutionState &state, 
@@ -1277,8 +1444,8 @@ void Executor::runFunctionAsMain(Function *f,
   globalObjects.clear();
   globalAddresses.clear();
 
-  if (statsTracker)
-    statsTracker->done();
+//  if (statsTracker)
+//    statsTracker->done();
 }
 
 unsigned Executor::getPathStreamID(const ExecutionState &state) {
@@ -1330,7 +1497,9 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
                                    std::pair<std::string,
                                    std::vector<unsigned char> > >
                                    &res) {
-  solver->setTimeout(coreSolverTimeout);
+  ExecutionRunner* runner = getCurrentRunner();
+
+  runner->solver->setTimeout(coreSolverTimeout);
 
   ExecutionState tmp(state);
 
@@ -1348,7 +1517,7 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
     for (; pi != pie; ++pi) {
       bool mustBeTrue;
       // Attempt to bound byte to constraints held in cexPreferences
-      bool success = solver->mustBeTrue(tmp, Expr::createIsZero(*pi), 
+      bool success = runner->solver->mustBeTrue(tmp, Expr::createIsZero(*pi),
 					mustBeTrue);
       // If it isn't possible to constrain this particular byte in the desired
       // way (normally this would mean that the byte can't be constrained to
@@ -1366,8 +1535,8 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
   std::vector<const Array*> objects;
   for (unsigned i = 0; i != state.symbolics.size(); ++i)
     objects.push_back(state.symbolics[i].second);
-  bool success = solver->getInitialValues(tmp, objects, values);
-  solver->setTimeout(0);
+  bool success = runner->solver->getInitialValues(tmp, objects, values);
+  runner->solver->setTimeout(0);
   if (!success) {
     klee_warning("unable to compute initial values (invalid constraints?)!");
     ExprPPrinter::printQuery(llvm::errs(), state.constraints,
@@ -1377,6 +1546,7 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
   
   for (unsigned i = 0; i != state.symbolics.size(); ++i)
     res.push_back(std::make_pair(state.symbolics[i].first->name, values[i]));
+
   return true;
 }
 
@@ -1398,45 +1568,57 @@ void Executor::prepareForEarlyExit() {
 
 /*######### PASSTHROUGH TO RUNNER #########*/
 
+ExecutionRunner* Executor::getCurrentRunner() const {
+  pthread_t thread = pthread_self();
+
+  for (auto& helper : jobs) {
+    if (thread == helper.thread) {
+      return helper.runner;
+    }
+  }
+
+  return mainRunner;
+}
+
 Executor::StatePair
 Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
-  return mainRunner->fork(current, condition, isInternal);
+  return getCurrentRunner()->fork(current, condition, isInternal);
 }
 
 void Executor::executeMakeSymbolic(ExecutionState &state,
                                    const MemoryObject *mo,
                                    const std::string &name) {
-  mainRunner->executeMakeSymbolic(state, mo, name);
+  getCurrentRunner()->executeMakeSymbolic(state, mo, name);
 }
 
 void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
-  return mainRunner->addConstraint(state, condition);
+  return getCurrentRunner()->addConstraint(state, condition);
 }
 
 void Executor::bindLocal(KInstruction *target, ExecutionState &state,
                          ref<Expr> value) {
-  return mainRunner->bindLocal(target, state, value);
+  return getCurrentRunner()->bindLocal(target, state, value);
 }
 
 void Executor::bindArgument(KFunction *kf, unsigned index,
                             ExecutionState &state, ref<Expr> value) {
-  return mainRunner->bindArgument(kf, index, state, value);
+  return getCurrentRunner()->bindArgument(kf, index, state, value);
 }
 
 ref<Expr> Executor::toUnique(const ExecutionState &state,
                              ref<Expr> &e) {
-  return mainRunner->toUnique(state, e);
+  return getCurrentRunner()->toUnique(state, e);
 }
 
 void Executor::executeGetValue(ExecutionState &state,
                                ref<Expr> e,
                                KInstruction *target) {
-  mainRunner->executeGetValue(state, e, target);
+  getCurrentRunner()->executeGetValue(state, e, target);
 }
 
 std::string Executor::getAddressInfo(ExecutionState &state,
                                      ref<Expr> address) const{
-  return mainRunner->getAddressInfo(state, address);
+  return getCurrentRunner()->getAddressInfo(state, address);
 }
 
 
@@ -1446,45 +1628,45 @@ void Executor::executeAlloc(ExecutionState &state,
                             KInstruction *target,
                             bool zeroMemory,
                             const ObjectState *reallocFrom) {
-  mainRunner->executeAlloc(state, size, isLocal, target, zeroMemory, reallocFrom);
+  getCurrentRunner()->executeAlloc(state, size, isLocal, target, zeroMemory, reallocFrom);
 }
 
 void Executor::executeFree(ExecutionState &state,
                            ref<Expr> address,
                            KInstruction *target) {
-  return mainRunner->executeFree(state, address, target);
+  return getCurrentRunner()->executeFree(state, address, target);
 }
 
 void Executor::resolveExact(ExecutionState &state,
                             ref<Expr> p,
                             ExactResolutionList &results,
                             const std::string &name) {
-  mainRunner->resolveExact(state, p, results, name);
+  getCurrentRunner()->resolveExact(state, p, results, name);
 }
 
 void Executor::createThread(ExecutionState &state, Thread::ThreadId tid,
                             ref<Expr> startRoutine, ref<Expr> arg) {
-  mainRunner->createThread(state, tid, startRoutine, arg);
+  getCurrentRunner()->createThread(state, tid, startRoutine, arg);
 }
 
 void Executor::sleepThread(ExecutionState &state) {
-  mainRunner->sleepThread(state);
+  getCurrentRunner()->sleepThread(state);
 }
 
 void Executor::wakeUpThread(ExecutionState &state, Thread::ThreadId tid) {
-  mainRunner->wakeUpThread(state, tid);
+  getCurrentRunner()->wakeUpThread(state, tid);
 }
 
 void Executor::preemptThread(ExecutionState &state) {
-  mainRunner->preemptThread(state);
+  getCurrentRunner()->preemptThread(state);
 }
 
 void Executor::exitThread(ExecutionState &state) {
-  mainRunner->exitThread(state);
+  getCurrentRunner()->exitThread(state);
 }
 
 void Executor::toggleThreadScheduling(ExecutionState &state, bool enabled) {
-  mainRunner->toggleThreadScheduling(state, enabled);
+  getCurrentRunner()->toggleThreadScheduling(state, enabled);
 }
 
 /// Returns the errno location in memory

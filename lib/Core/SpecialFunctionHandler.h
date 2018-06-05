@@ -83,7 +83,7 @@ namespace klee {
     /// prepared for execution.
     void bind();
 
-    bool handle(ExecutionState &state, 
+    bool handle(ExecutionState &state,
                 llvm::Function *f,
                 KInstruction *target,
                 std::vector< ref<Expr> > &arguments);

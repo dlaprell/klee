@@ -261,8 +261,8 @@ bool WeightedRandomSearcher::empty() {
 }
 
 ///
-RandomPathSearcher::RandomPathSearcher(Executor &_executor)
-  : executor(_executor) {
+RandomPathSearcher::RandomPathSearcher(ExecutorStateProvider* _provider)
+  : provider(_provider) {
 }
 
 RandomPathSearcher::~RandomPathSearcher() {
@@ -270,7 +270,7 @@ RandomPathSearcher::~RandomPathSearcher() {
 
 ExecutionState &RandomPathSearcher::selectState() {
   unsigned flips=0, bits=0;
-  PTree::Node *n = executor.processTree->root;
+  PTree::Node *n = provider->getCurrentTree()->root;
   while (!n->data) {
     if (!n->left) {
       n = n->right;
@@ -296,13 +296,13 @@ RandomPathSearcher::update(ExecutionState *current,
 }
 
 bool RandomPathSearcher::empty() { 
-  return executor.states.empty(); 
+  return provider->getCurrentStates()->empty();
 }
 
 ///
 
-MergingSearcher::MergingSearcher(Executor &_executor, Searcher *_baseSearcher)
-  : executor(_executor),
+MergingSearcher::MergingSearcher(ExecutorStateProvider *_provider, Searcher *_baseSearcher)
+  : provider(_provider),
   baseSearcher(_baseSearcher){}
 
 MergingSearcher::~MergingSearcher() {
@@ -313,7 +313,7 @@ ExecutionState& MergingSearcher::selectState() {
   assert(!baseSearcher->empty() && "base searcher is empty");
 
   // Iterate through all MergeHandlers
-  for (auto cur_mergehandler: executor.mergeGroups) {
+  for (auto cur_mergehandler: provider->getCurrentMergeGroups()) {
     // Find one that has states that could be released
     if (!cur_mergehandler->hasMergedStates()) {
       continue;

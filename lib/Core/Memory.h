@@ -18,6 +18,7 @@
 
 #include <vector>
 #include <string>
+#include <atomic>
 
 namespace llvm {
   class Value;
@@ -38,7 +39,7 @@ class MemoryObject {
 
 private:
   static int counter;
-  mutable unsigned refCount;
+  mutable std::atomic<unsigned> refCount;
 
 public:
   unsigned id;
@@ -151,7 +152,7 @@ private:
   unsigned copyOnWriteOwner; // exclusively for AddressSpace
 
   friend class ObjectHolder;
-  unsigned refCount;
+  std::atomic<unsigned> refCount;
 
   const MemoryObject *object;
 

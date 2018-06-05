@@ -23,6 +23,7 @@
 #include <set>
 #include <vector>
 #include <map>
+#include <atomic>
 
 namespace llvm {
   class Type;
@@ -172,7 +173,7 @@ public:
     CmpKindLast=Sge
   };
 
-  unsigned refCount;
+  std::atomic<unsigned> refCount;
 
 protected:  
   unsigned hashValue;
@@ -449,7 +450,7 @@ public:
 class UpdateNode {
   friend class UpdateList;  
 
-  mutable unsigned refCount;
+  mutable std::atomic<unsigned> refCount;
   // cache instead of recalc
   unsigned hashValue;
 

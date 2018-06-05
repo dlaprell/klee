@@ -44,6 +44,7 @@ namespace klee {
   // the actual memory will always be saved in the ExecutionState
   class Thread {
     friend class Executor;
+    friend class ExecutionRunner;
     friend class ExecutionState;
     friend class StatsTracker;
     friend class Searcher;

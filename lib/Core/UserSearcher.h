@@ -10,6 +10,8 @@
 #ifndef KLEE_USERSEARCHER_H
 #define KLEE_USERSEARCHER_H
 
+#include "Searcher.h"
+
 namespace klee {
   class Executor;
   class Searcher;
@@ -19,7 +21,7 @@ namespace klee {
 
   void initializeSearchOptions();
 
-  Searcher *constructUserSearcher(Executor &executor);
+  Searcher *constructUserSearcher(ExecutorStateProvider *provider);
 }
 
 #endif

@@ -81,13 +81,13 @@ bool klee::userSearcherRequiresMD2U() {
 }
 
 
-Searcher *getNewSearcher(Searcher::CoreSearchType type, Executor &executor) {
+Searcher *getNewSearcher(Searcher::CoreSearchType type, ExecutorStateProvider* provider) {
   Searcher *searcher = NULL;
   switch (type) {
   case Searcher::DFS: searcher = new DFSSearcher(); break;
   case Searcher::BFS: searcher = new BFSSearcher(); break;
   case Searcher::RandomState: searcher = new RandomSearcher(); break;
-  case Searcher::RandomPath: searcher = new RandomPathSearcher(executor); break;
+  case Searcher::RandomPath: searcher = new RandomPathSearcher(provider); break;
   case Searcher::NURS_CovNew: searcher = new WeightedRandomSearcher(WeightedRandomSearcher::CoveringNew); break;
   case Searcher::NURS_MD2U: searcher = new WeightedRandomSearcher(WeightedRandomSearcher::MinDistToUncovered); break;
   case Searcher::NURS_Depth: searcher = new WeightedRandomSearcher(WeightedRandomSearcher::Depth); break;
@@ -99,16 +99,16 @@ Searcher *getNewSearcher(Searcher::CoreSearchType type, Executor &executor) {
   return searcher;
 }
 
-Searcher *klee::constructUserSearcher(Executor &executor) {
+Searcher *klee::constructUserSearcher(ExecutorStateProvider *provider) {
 
-  Searcher *searcher = getNewSearcher(CoreSearch[0], executor);
+  Searcher *searcher = getNewSearcher(CoreSearch[0], provider);
   
   if (CoreSearch.size() > 1) {
     std::vector<Searcher *> s;
     s.push_back(searcher);
 
     for (unsigned i=1; i<CoreSearch.size(); i++)
-      s.push_back(getNewSearcher(CoreSearch[i], executor));
+      s.push_back(getNewSearcher(CoreSearch[i], provider));
     
     searcher = new InterleavedSearcher(s);
   }
@@ -124,18 +124,19 @@ Searcher *klee::constructUserSearcher(Executor &executor) {
   }
 
   if (UseMerge && UseIncompleteMerge) {
-    searcher = new MergingSearcher(executor, searcher);
+    searcher = new MergingSearcher(provider, searcher);
   }
 
   if (UseIterativeDeepeningTimeSearch) {
     searcher = new IterativeDeepeningTimeSearcher(searcher);
   }
 
-  llvm::raw_ostream &os = executor.getHandler().getInfoStream();
-
-  os << "BEGIN searcher description\n";
-  searcher->printName(os);
-  os << "END searcher description\n";
+// TODO: Bring back support
+//  llvm::raw_ostream &os = executor.getHandler().getInfoStream();
+//
+//  os << "BEGIN searcher description\n";
+//  searcher->printName(os);
+//  os << "END searcher description\n";
 
   return searcher;
 }

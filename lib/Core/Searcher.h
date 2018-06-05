@@ -11,10 +11,12 @@
 #define KLEE_SEARCHER_H
 
 #include "llvm/Support/raw_ostream.h"
+#include "PTree.h"
 #include <vector>
 #include <set>
 #include <map>
 #include <queue>
+#include "klee/MergeHandler.h"
 
 namespace llvm {
   class BasicBlock;
@@ -26,7 +28,13 @@ namespace llvm {
 namespace klee {
   template<class T> class DiscretePDF;
   class ExecutionState;
-  class Executor;
+
+  class ExecutorStateProvider {
+    public:
+      virtual std::set<ExecutionState*>* getCurrentStates() = 0;
+      virtual PTree* getCurrentTree() = 0;
+      virtual std::vector<MergeHandler *> getCurrentMergeGroups() = 0;
+  };
 
   class Searcher {
   public:
@@ -164,10 +172,10 @@ namespace klee {
   };
 
   class RandomPathSearcher : public Searcher {
-    Executor &executor;
+    ExecutorStateProvider *provider;
 
   public:
-    RandomPathSearcher(Executor &_executor);
+    RandomPathSearcher(ExecutorStateProvider* provider);
     ~RandomPathSearcher();
 
     ExecutionState &selectState();
@@ -186,11 +194,11 @@ namespace klee {
 
     private:
 
-    Executor &executor;
+    ExecutorStateProvider *provider;
     Searcher *baseSearcher;
 
     public:
-    MergingSearcher(Executor &executor, Searcher *baseSearcher);
+    MergingSearcher(ExecutorStateProvider *provider, Searcher *baseSearcher);
     ~MergingSearcher();
 
     ExecutionState &selectState();

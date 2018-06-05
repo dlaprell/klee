@@ -126,7 +126,19 @@ public:
   };
 
 private:
+  typedef struct {
+    pthread_t thread;
+    ExecutionRunner* runner;
+    bool spawnedThread;
+  } JobHelper;
+
   ExecutionRunner* mainRunner;
+
+  pthread_mutex_t terminateLock;
+
+
+  std::vector<JobHelper> jobs;
+  pthread_mutex_t memoryLock;
 
   static const char *TerminateReasonNames[];
 
@@ -216,7 +228,11 @@ private:
 
   /// Signals the executor to halt execution at the next instruction
   /// step.
+#ifdef KLEE_THREADING_SUPPORT
+  std::atomic<bool> haltExecution;
+#else
   bool haltExecution;
+#endif
 
   /// Whether implied-value concretization is enabled. Currently
   /// false, it is buggy (it needs to validate its writes).
@@ -240,6 +256,14 @@ private:
 
   llvm::Function* getTargetFunction(llvm::Value *calledVal,
                                     ExecutionState &state);
+
+  TimingSolver* createNewSolver();
+
+  void createJobHelper();
+
+  void balanceRunners(ExecutionRunner* to, ExecutionRunner* from);
+
+  ExecutionRunner* getCurrentRunner() const;
 
   void executeInstruction(ExecutionState &state, KInstruction *ki);
 
@@ -493,6 +517,14 @@ public:
   Executor(llvm::LLVMContext &ctx, const InterpreterOptions &opts,
       InterpreterHandler *ie);
   virtual ~Executor();
+
+  MemoryObject *doAllocate(uint64_t size, bool isLocal,
+                                         bool isGlobal,
+                                         const llvm::Value *allocSite,
+                                         size_t alignment);
+
+  MemoryObject *doAllocateFixed(uint64_t address, uint64_t size,
+                                  const llvm::Value *allocSite);
 
   const InterpreterHandler& getHandler() {
     return *interpreterHandler;

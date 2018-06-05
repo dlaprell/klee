@@ -85,10 +85,23 @@ ExecutionState::~ExecutionState() {
   for (auto& it : threads) {
     Thread thread = it.second;
 
+    for (auto &access : thread.syncPhaseAccesses) {
+      const MemoryObject *mo = access.first;
+      assert(mo->refCount > 0);
+      mo->refCount--;
+      if (mo->refCount == 0) {
+        delete mo;
+      }
+    }
+
+    thread.syncPhaseAccesses.clear();
+
     while (!thread.stack.empty()) {
       popFrameOfThread(&thread);
     }
   }
+
+  threads.clear();
 }
 
 ExecutionState::ExecutionState(const ExecutionState& state):
@@ -147,8 +160,8 @@ Thread* ExecutionState::getCurrentThreadReference() const {
 }
 
 void ExecutionState::popFrameOfThread(Thread* thread) {
-  // TODO: we should probably do this in the tread?
-  // We want to unbind all the objects from the current tread frame
+  // TODO: we should probably do this in the thread?
+  // We want to unbind all the objects from the current thread frame
   StackFrame &sf = thread->stack.back();
   for (auto &it : sf.allocas) {
     addressSpace.unbindObject(it);
